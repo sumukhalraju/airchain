@@ -1,25 +1,19 @@
 const express = require("express");
 const anchor = require("@coral-xyz/anchor");
 const cors = require("cors");
-
 const { Connection, Keypair, PublicKey } = require("@solana/web3.js");
 require("dotenv").config();
 
 const app = express();
 app.use(express.json());
 app.use(cors());
-// Connection
-const connection = new Connection("https://api.devnet.solana.com", "confirmed");
 
-// Load wallet
+const connection = new Connection("https://api.devnet.solana.com", "confirmed");
 const privateKeyArray = JSON.parse(process.env.PRIVATE_KEY);
 const wallet = Keypair.fromSecretKey(Uint8Array.from(privateKeyArray));
 const anchorWallet = new anchor.Wallet(wallet);
-
-// Program ID
 const PROGRAM_ID = new PublicKey("5UB7ModzcxkMMx93sSemD7NR3S5NKBx1RhEg6VPQHeDd");
 
-// IDL — copy this from Solana Playground
 const IDL = {
   version: "0.1.0",
   name: "airchain",
@@ -109,13 +103,11 @@ const IDL = {
   ],
 };
 
-// Anchor provider and program
 const provider = new anchor.AnchorProvider(connection, anchorWallet, {
   commitment: "confirmed",
 });
 const program = new anchor.Program(IDL, PROGRAM_ID, provider);
 
-// Helper to find PDAs
 async function findLocalityPDA(name) {
   const [pda] = await PublicKey.findProgramAddress(
     [Buffer.from("locality"), Buffer.from(name)],
@@ -142,7 +134,6 @@ async function findReadingPDA(nodeId, readingCount) {
   return pda;
 }
 
-// Initialize locality if it doesn't exist
 async function ensureLocality(name) {
   const localityPDA = await findLocalityPDA(name);
   try {
@@ -163,7 +154,6 @@ async function ensureLocality(name) {
   return localityPDA;
 }
 
-// Register node if it doesn't exist
 async function ensureNode(nodeId, localityName) {
   const nodePDA = await findNodePDA(nodeId);
   const localityPDA = await findLocalityPDA(localityName);
@@ -186,26 +176,26 @@ async function ensureNode(nodeId, localityName) {
   return nodePDA;
 }
 
-// Submit reading endpoint
 app.post("/submit", async (req, res) => {
   try {
-    const { node_id, co2, temperature, humidity, aqi, signature } = req.body;
-    const localityName = "Bengaluru";
+    let node_id, co2, temperature, humidity, aqi, signature;
 
+    if (req.body.data) {
+      ({ node_id, co2, temperature, humidity, aqi } = req.body.data);
+      signature = req.body.signature;
+    } else {
+      ({ node_id, co2, temperature, humidity, aqi, signature } = req.body);
+    }
+
+    const localityName = "Bengaluru";
     console.log(`Received from ${node_id}:`, { co2, temperature, humidity, aqi });
 
-    // Ensure locality and node exist
     const localityPDA = await ensureLocality(localityName);
     const nodePDA = await ensureNode(node_id, localityName);
-
-    // Get current reading count
     const nodeAccount = await program.account.node.fetch(nodePDA);
     const readingCount = nodeAccount.readingCount.toNumber();
-
-    // Find reading PDA
     const readingPDA = await findReadingPDA(node_id, readingCount);
 
-    // Submit reading
     const tx = await program.methods
       .submitReading(
         parseFloat(co2),
@@ -233,7 +223,6 @@ app.post("/submit", async (req, res) => {
   }
 });
 
-// Get all readings for a node
 app.get("/readings/:nodeId", async (req, res) => {
   try {
     const { nodeId } = req.params;
@@ -245,10 +234,7 @@ app.get("/readings/:nodeId", async (req, res) => {
     for (let i = 0; i < readingCount; i++) {
       const readingPDA = await findReadingPDA(nodeId, i);
       const reading = await program.account.reading.fetch(readingPDA);
-      readings.push({
-        ...reading,
-        index: i,
-      });
+      readings.push({ ...reading, index: i });
     }
 
     res.json({ success: true, readings });
@@ -257,7 +243,6 @@ app.get("/readings/:nodeId", async (req, res) => {
   }
 });
 
-// Get locality info
 app.get("/locality/:name", async (req, res) => {
   try {
     const localityPDA = await findLocalityPDA(req.params.name);
