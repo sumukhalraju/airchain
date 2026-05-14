@@ -3,6 +3,7 @@ const anchor = require("@coral-xyz/anchor");
 const cors = require("cors");
 const fs = require("fs");
 const path = require("path");
+const nacl = require("tweetnacl");
 const { Connection, Keypair, PublicKey } = require("@solana/web3.js");
 require("dotenv").config();
 
@@ -11,8 +12,25 @@ app.use(express.json());
 app.use(cors());
 
 const connection = new Connection("https://api.devnet.solana.com", "confirmed");
-const privateKeyArray = JSON.parse(process.env.PRIVATE_KEY);
-const wallet = Keypair.fromSecretKey(Uint8Array.from(privateKeyArray));
+
+function loadWallet() {
+  if (!process.env.PRIVATE_KEY) {
+    console.error("FATAL: PRIVATE_KEY environment variable is not set. Create a .env file or set it in the environment.");
+    process.exit(1);
+  }
+  try {
+    const privateKeyArray = JSON.parse(process.env.PRIVATE_KEY);
+    if (!Array.isArray(privateKeyArray) || privateKeyArray.length !== 64) {
+      console.error("FATAL: PRIVATE_KEY must be a JSON array of 64 integers (Solana keypair secret key).");
+      process.exit(1);
+    }
+    return Keypair.fromSecretKey(Uint8Array.from(privateKeyArray));
+  } catch (err) {
+    console.error("FATAL: Failed to parse PRIVATE_KEY:", err.message);
+    process.exit(1);
+  }
+}
+const wallet = loadWallet();
 const anchorWallet = new anchor.Wallet(wallet);
 const PROGRAM_ID = new PublicKey("5UB7ModzcxkMMx93sSemD7NR3S5NKBx1RhEg6VPQHeDd");
 
@@ -113,6 +131,30 @@ const program = new anchor.Program(IDL, PROGRAM_ID, provider);
 const txSignatureStorePath = path.join(__dirname, "tx-signatures.json");
 const txSignatureStore = loadTxSignatureStore();
 
+function hexToBytes(hex) {
+  const bytes = Buffer.alloc(hex.length / 2);
+  for (let i = 0; i < hex.length; i += 2) {
+    bytes[i / 2] = parseInt(hex.substring(i, i + 2), 16);
+  }
+  return bytes;
+}
+
+function verifyNodeSignature(nodeId, co2, temp, humidity, aqi, signatureHex, publicKeyHex) {
+  if (!signatureHex || !publicKeyHex) return false;
+  try {
+    const sig = hexToBytes(signatureHex);
+    const pub = hexToBytes(publicKeyHex);
+    if (sig.length !== 64 || pub.length !== 32) return false;
+
+    const dataStr = `{"node_id":"${nodeId}","temperature":${parseFloat(temp).toFixed(2)},"humidity":${parseFloat(humidity).toFixed(2)},"aqi":${parseFloat(aqi).toFixed(2)},"co2":${parseFloat(co2).toFixed(2)}}`;
+    const message = Buffer.from(dataStr, "utf8");
+
+    return nacl.sign.detached.verify(message, sig, pub);
+  } catch {
+    return false;
+  }
+}
+
 function loadTxSignatureStore() {
   try {
     if (!fs.existsSync(txSignatureStorePath)) return {};
@@ -126,11 +168,9 @@ function loadTxSignatureStore() {
 }
 
 function saveTxSignatureStore(store) {
-  try {
-    fs.writeFileSync(txSignatureStorePath, JSON.stringify(store, null, 2), "utf8");
-  } catch (err) {
-    console.warn("Failed to save tx signature store:", err.message);
-  }
+  fs.writeFile(txSignatureStorePath, JSON.stringify(store, null, 2), "utf8", (err) => {
+    if (err) console.warn("Failed to save tx signature store:", err.message);
+  });
 }
 
 function getStoredTxSignature(address) {
@@ -209,16 +249,27 @@ async function getConfirmedSignatureForAddress(address) {
     }
     return null;
   } catch (err) {
-    console.warn("Failed to confirm tx signature:", err.message);
+    if (err?.message?.includes("version") || err?.message?.includes("unsupported")) {
+      try {
+        const signatures = await connection.getSignaturesForAddress(address, { limit: 5 });
+        for (const sigInfo of signatures) {
+          if (sigInfo.err) continue;
+          return sigInfo.signature;
+        }
+      } catch { /* fall through */ }
+    } else {
+      console.warn("Failed to confirm tx signature:", err.message);
+    }
     return null;
   }
 }
 
 function withTimeout(promise, ms, fallback) {
-  return Promise.race([
-    promise,
-    new Promise((resolve) => setTimeout(() => resolve(fallback), ms)),
-  ]);
+  let timer;
+  const timeout = new Promise((resolve) => {
+    timer = setTimeout(() => resolve(fallback), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
 
 async function ensureLocality(name) {
@@ -226,19 +277,23 @@ async function ensureLocality(name) {
   try {
     await program.account.locality.fetch(localityPDA);
     console.log("Locality already exists:", name);
-  } catch {
-    console.log("Creating locality:", name);
-    await program.methods
-      .initializeLocality(name)
-      .accounts({
-        locality: localityPDA,
-        authority: wallet.publicKey,
-        systemProgram: anchor.web3.SystemProgram.programId,
-      })
-      .signers([wallet])
-      .rpc();
+    return localityPDA;
+  } catch (err) {
+    if (err.message && err.message.includes("Account does not exist")) {
+      console.log("Creating locality:", name);
+      await program.methods
+        .initializeLocality(name)
+        .accounts({
+          locality: localityPDA,
+          authority: wallet.publicKey,
+          systemProgram: anchor.web3.SystemProgram.programId,
+        })
+        .signers([wallet])
+        .rpc();
+      return localityPDA;
+    }
+    throw err;
   }
-  return localityPDA;
 }
 
 async function ensureNode(nodeId, localityName) {
@@ -247,31 +302,73 @@ async function ensureNode(nodeId, localityName) {
   try {
     await program.account.node.fetch(nodePDA);
     console.log("Node already exists:", nodeId);
-  } catch {
-    console.log("Registering node:", nodeId);
-    await program.methods
-      .registerNode(nodeId, localityName)
-      .accounts({
-        node: nodePDA,
-        locality: localityPDA,
-        authority: wallet.publicKey,
-        systemProgram: anchor.web3.SystemProgram.programId,
-      })
-      .signers([wallet])
-      .rpc();
+    return nodePDA;
+  } catch (err) {
+    if (err.message && err.message.includes("Account does not exist")) {
+      console.log("Registering node:", nodeId);
+      await program.methods
+        .registerNode(nodeId, localityName)
+        .accounts({
+          node: nodePDA,
+          locality: localityPDA,
+          authority: wallet.publicKey,
+          systemProgram: anchor.web3.SystemProgram.programId,
+        })
+        .signers([wallet])
+        .rpc();
+      return nodePDA;
+    }
+    throw err;
   }
-  return nodePDA;
 }
 
 app.post("/submit", async (req, res) => {
   try {
-    let node_id, co2, temperature, humidity, aqi, signature;
+    let node_id, co2, temperature, humidity, aqi, signature, publicKey;
 
     if (req.body.data) {
       ({ node_id, co2, temperature, humidity, aqi } = req.body.data);
       signature = req.body.signature;
+      publicKey = req.body.publicKey;
     } else {
-      ({ node_id, co2, temperature, humidity, aqi, signature } = req.body);
+      ({ node_id, co2, temperature, humidity, aqi, signature, publicKey } = req.body);
+    }
+
+    if (!node_id || typeof node_id !== "string") {
+      return res.status(400).json({ success: false, error: "Missing or invalid node_id" });
+    }
+
+    co2 = parseFloat(co2);
+    temperature = parseFloat(temperature);
+    humidity = parseFloat(humidity);
+    aqi = parseFloat(aqi);
+
+    if (isNaN(co2) || isNaN(temperature) || isNaN(humidity) || isNaN(aqi)) {
+      return res.status(400).json({ success: false, error: "co2, temperature, humidity, and aqi must be valid numbers" });
+    }
+
+    if (signature && publicKey) {
+      const valid = verifyNodeSignature(node_id, co2, temperature, humidity, aqi, signature, publicKey);
+      if (!valid) {
+        console.warn(`Invalid signature from node ${node_id}`);
+        return res.status(401).json({ success: false, error: "Invalid node signature" });
+      }
+      console.log(`Node ${node_id} signature verified`);
+    } else {
+      console.warn(`Missing signature or publicKey from node ${node_id}`);
+    }
+
+    if (!node_id || typeof node_id !== "string") {
+      return res.status(400).json({ success: false, error: "Missing or invalid node_id" });
+    }
+
+    co2 = parseFloat(co2);
+    temperature = parseFloat(temperature);
+    humidity = parseFloat(humidity);
+    aqi = parseFloat(aqi);
+
+    if (isNaN(co2) || isNaN(temperature) || isNaN(humidity) || isNaN(aqi)) {
+      return res.status(400).json({ success: false, error: "co2, temperature, humidity, and aqi must be valid numbers" });
     }
 
     const localityName = "Bengaluru";
@@ -285,10 +382,10 @@ app.post("/submit", async (req, res) => {
 
     const tx = await program.methods
       .submitReading(
-        parseFloat(co2),
-        parseFloat(temperature),
-        parseFloat(humidity),
-        parseFloat(aqi),
+        co2,
+        temperature,
+        humidity,
+        aqi,
         signature || "no-signature"
       )
       .accounts({
@@ -315,29 +412,14 @@ app.get("/readings/:nodeId", async (req, res) => {
   try {
     const { nodeId } = req.params;
     const nodePDA = await findNodePDA(nodeId);
-    const nodeAccount = await withTimeout(
-      program.account.node.fetch(nodePDA),
-      8000,
-      null
-    );
-    if (!nodeAccount) {
-      return res.status(404).json({ success: false, error: "Node not found or RPC timeout" });
-    }
+    const nodeAccount = await program.account.node.fetch(nodePDA);
     const readingCount = nodeAccount.readingCount.toNumber();
 
     const readings = await Promise.all(
       Array.from({ length: readingCount }, async (_, i) => {
         const readingPDA = await findReadingPDA(nodeId, i);
         const reading = await program.account.reading.fetch(readingPDA);
-        let txSignature = getStoredTxSignature(readingPDA);
-        if (!txSignature) {
-          txSignature = await withTimeout(
-            getConfirmedSignatureForAddress(readingPDA),
-            3000,
-            null
-          );
-          if (txSignature) storeTxSignature(readingPDA, txSignature);
-        }
+        const txSignature = getStoredTxSignature(readingPDA);
         return normalizeReading(reading, i, txSignature);
       })
     );
@@ -352,6 +434,9 @@ app.get("/tx-signature/:nodeId/:index", async (req, res) => {
   try {
     const { nodeId, index } = req.params;
     const readingIdx = parseInt(index, 10);
+    if (isNaN(readingIdx) || readingIdx < 0) {
+      return res.status(400).json({ success: false, error: "index must be a non-negative integer" });
+    }
     const readingPDA = await findReadingPDA(nodeId, readingIdx);
 
     const stored = getStoredTxSignature(readingPDA);
@@ -378,14 +463,7 @@ app.get("/tx-signature/:nodeId/:index", async (req, res) => {
 app.get("/locality/:name", async (req, res) => {
   try {
     const localityPDA = await findLocalityPDA(req.params.name);
-    const locality = await withTimeout(
-      program.account.locality.fetch(localityPDA),
-      8000,
-      null
-    );
-    if (!locality) {
-      return res.status(404).json({ success: false, error: "Locality not found or RPC timeout" });
-    }
+    const locality = await program.account.locality.fetch(localityPDA);
     res.json({
       success: true,
       locality: {
@@ -409,4 +487,11 @@ app.listen(PORT, () => {
   console.log(`AirChain server running on port ${PORT}`);
   console.log(`Wallet: ${wallet.publicKey.toString()}`);
   console.log(`Program: ${PROGRAM_ID.toString()}`);
+});
+
+process.on("uncaughtException", (err) => {
+  console.error("Uncaught exception:", err.message);
+});
+process.on("unhandledRejection", (reason) => {
+  console.error("Unhandled rejection:", reason?.message || reason);
 });
