@@ -412,7 +412,15 @@ app.get("/readings/:nodeId", async (req, res) => {
   try {
     const { nodeId } = req.params;
     const nodePDA = await findNodePDA(nodeId);
-    const nodeAccount = await program.account.node.fetch(nodePDA);
+    let nodeAccount;
+    try {
+      nodeAccount = await program.account.node.fetch(nodePDA);
+    } catch (err) {
+      if (err.message && err.message.includes("Account does not exist")) {
+        return res.json({ success: true, readings: [] });
+      }
+      throw err;
+    }
     const readingCount = nodeAccount.readingCount.toNumber();
 
     const MAX_CONCURRENT = 10;
@@ -482,7 +490,15 @@ app.get("/tx-signature/:nodeId/:index", async (req, res) => {
 app.get("/locality/:name", async (req, res) => {
   try {
     const localityPDA = await findLocalityPDA(req.params.name);
-    const locality = await program.account.locality.fetch(localityPDA);
+    let locality;
+    try {
+      locality = await program.account.locality.fetch(localityPDA);
+    } catch (err) {
+      if (err.message && err.message.includes("Account does not exist")) {
+        return res.status(404).json({ success: false, error: "Locality not found" });
+      }
+      throw err;
+    }
     res.json({
       success: true,
       locality: {
