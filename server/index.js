@@ -1,6 +1,8 @@
 const express = require("express");
 const anchor = require("@coral-xyz/anchor");
 const cors = require("cors");
+const fs = require("fs");
+const path = require("path");
 const { Connection, Keypair, PublicKey } = require("@solana/web3.js");
 require("dotenv").config();
 
@@ -108,6 +110,66 @@ const provider = new anchor.AnchorProvider(connection, anchorWallet, {
 });
 const program = new anchor.Program(IDL, PROGRAM_ID, provider);
 
+const txSignatureStorePath = path.join(__dirname, "tx-signatures.json");
+const txSignatureStore = loadTxSignatureStore();
+
+function loadTxSignatureStore() {
+  try {
+    if (!fs.existsSync(txSignatureStorePath)) return {};
+    const raw = fs.readFileSync(txSignatureStorePath, "utf8");
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch (err) {
+    console.warn("Failed to load tx signature store:", err.message);
+    return {};
+  }
+}
+
+function saveTxSignatureStore(store) {
+  try {
+    fs.writeFileSync(txSignatureStorePath, JSON.stringify(store, null, 2), "utf8");
+  } catch (err) {
+    console.warn("Failed to save tx signature store:", err.message);
+  }
+}
+
+function getStoredTxSignature(address) {
+  return txSignatureStore[address.toString()] || null;
+}
+
+function storeTxSignature(address, signature) {
+  if (!signature) return;
+  const key = address.toString();
+  if (txSignatureStore[key] === signature) return;
+  txSignatureStore[key] = signature;
+  saveTxSignatureStore(txSignatureStore);
+}
+
+function normalizeAnchorValue(value) {
+  if (value === null || value === undefined) return value;
+  if (typeof value === "string" || typeof value === "number") return value;
+  if (typeof value.toNumber === "function") return value.toNumber();
+  if (typeof value.toString === "function" && value.constructor?.name === "BN") {
+    return BigInt(value.toString()).toString();
+  }
+  return value;
+}
+
+function normalizeReading(reading, i, txSignature) {
+  return {
+    nodeId: reading.nodeId,
+    co2: normalizeAnchorValue(reading.co2),
+    temperature: normalizeAnchorValue(reading.temperature),
+    humidity: normalizeAnchorValue(reading.humidity),
+    aqi: normalizeAnchorValue(reading.aqi),
+    signature: reading.signature,
+    timestamp: normalizeAnchorValue(reading.timestamp),
+    locality: reading.locality,
+    index: i,
+    txSignature: txSignature || null,
+  };
+}
+
 async function findLocalityPDA(name) {
   const [pda] = await PublicKey.findProgramAddress(
     [Buffer.from("locality"), Buffer.from(name)],
@@ -132,6 +194,31 @@ async function findReadingPDA(nodeId, readingCount) {
     PROGRAM_ID
   );
   return pda;
+}
+
+async function getConfirmedSignatureForAddress(address) {
+  try {
+    const signatures = await connection.getSignaturesForAddress(address, { limit: 5 });
+    for (const sigInfo of signatures) {
+      if (sigInfo.err) continue;
+      const tx = await connection.getTransaction(sigInfo.signature, {
+        commitment: "confirmed",
+        maxSupportedTransactionVersion: 0,
+      });
+      if (tx) return sigInfo.signature;
+    }
+    return null;
+  } catch (err) {
+    console.warn("Failed to confirm tx signature:", err.message);
+    return null;
+  }
+}
+
+function withTimeout(promise, ms, fallback) {
+  return Promise.race([
+    promise,
+    new Promise((resolve) => setTimeout(() => resolve(fallback), ms)),
+  ]);
 }
 
 async function ensureLocality(name) {
@@ -215,6 +302,7 @@ app.post("/submit", async (req, res) => {
       .rpc();
 
     console.log("Reading stored on-chain! Tx:", tx);
+    storeTxSignature(readingPDA, tx);
     res.json({ success: true, signature: tx, readingCount });
 
   } catch (err) {
@@ -227,17 +315,61 @@ app.get("/readings/:nodeId", async (req, res) => {
   try {
     const { nodeId } = req.params;
     const nodePDA = await findNodePDA(nodeId);
-    const nodeAccount = await program.account.node.fetch(nodePDA);
+    const nodeAccount = await withTimeout(
+      program.account.node.fetch(nodePDA),
+      8000,
+      null
+    );
+    if (!nodeAccount) {
+      return res.status(404).json({ success: false, error: "Node not found or RPC timeout" });
+    }
     const readingCount = nodeAccount.readingCount.toNumber();
 
-    const readings = [];
-    for (let i = 0; i < readingCount; i++) {
-      const readingPDA = await findReadingPDA(nodeId, i);
-      const reading = await program.account.reading.fetch(readingPDA);
-      readings.push({ ...reading, index: i });
-    }
+    const readings = await Promise.all(
+      Array.from({ length: readingCount }, async (_, i) => {
+        const readingPDA = await findReadingPDA(nodeId, i);
+        const reading = await program.account.reading.fetch(readingPDA);
+        let txSignature = getStoredTxSignature(readingPDA);
+        if (!txSignature) {
+          txSignature = await withTimeout(
+            getConfirmedSignatureForAddress(readingPDA),
+            3000,
+            null
+          );
+          if (txSignature) storeTxSignature(readingPDA, txSignature);
+        }
+        return normalizeReading(reading, i, txSignature);
+      })
+    );
 
     res.json({ success: true, readings });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.get("/tx-signature/:nodeId/:index", async (req, res) => {
+  try {
+    const { nodeId, index } = req.params;
+    const readingIdx = parseInt(index, 10);
+    const readingPDA = await findReadingPDA(nodeId, readingIdx);
+
+    const stored = getStoredTxSignature(readingPDA);
+    if (stored) {
+      return res.json({ success: true, signature: stored, cached: true });
+    }
+
+    const confirmed = await withTimeout(
+      getConfirmedSignatureForAddress(readingPDA),
+      6000,
+      null
+    );
+    if (confirmed) {
+      storeTxSignature(readingPDA, confirmed);
+      return res.json({ success: true, signature: confirmed, cached: false });
+    }
+
+    res.json({ success: false, signature: null });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
@@ -246,8 +378,23 @@ app.get("/readings/:nodeId", async (req, res) => {
 app.get("/locality/:name", async (req, res) => {
   try {
     const localityPDA = await findLocalityPDA(req.params.name);
-    const locality = await program.account.locality.fetch(localityPDA);
-    res.json({ success: true, locality });
+    const locality = await withTimeout(
+      program.account.locality.fetch(localityPDA),
+      8000,
+      null
+    );
+    if (!locality) {
+      return res.status(404).json({ success: false, error: "Locality not found or RPC timeout" });
+    }
+    res.json({
+      success: true,
+      locality: {
+        name: locality.name,
+        nodeCount: normalizeAnchorValue(locality.nodeCount),
+        averageAqi: normalizeAnchorValue(locality.averageAqi),
+        authority: locality.authority.toString(),
+      },
+    });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
