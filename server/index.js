@@ -11,7 +11,25 @@ const app = express();
 app.use(express.json());
 app.use(cors());
 
-const connection = new Connection("https://api.devnet.solana.com", "confirmed");
+const HELIUS_API_KEY = process.env.HELIUS_API_KEY || "63dc437f-24d6-48e8-99df-d3d9cd652abb";
+const RPC_URL = `https://devnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
+const connection = new Connection(RPC_URL, "confirmed");
+
+async function withRetry(fn, maxRetries = 3) {
+  let lastErr;
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastErr = err;
+      if (attempt < maxRetries - 1) {
+        console.warn(`RPC attempt ${attempt + 1} failed (${err.message}), retrying in ${500 * (attempt + 1)}ms...`);
+        await new Promise((r) => setTimeout(r, 500 * (attempt + 1)));
+      }
+    }
+  }
+  throw lastErr;
+}
 
 function loadWallet() {
   if (!process.env.PRIVATE_KEY) {
@@ -414,7 +432,7 @@ app.get("/readings/:nodeId", async (req, res) => {
     const nodePDA = await findNodePDA(nodeId);
     let nodeAccount;
     try {
-      nodeAccount = await program.account.node.fetch(nodePDA);
+      nodeAccount = await withRetry(() => program.account.node.fetch(nodePDA));
     } catch (err) {
       if (err.message && err.message.includes("Account does not exist")) {
         return res.json({ success: true, readings: [] });
@@ -436,7 +454,7 @@ app.get("/readings/:nodeId", async (req, res) => {
         batch.map(async (idx) => {
           try {
             const readingPDA = await findReadingPDA(nodeId, idx);
-            const reading = await program.account.reading.fetch(readingPDA);
+            const reading = await withRetry(() => program.account.reading.fetch(readingPDA));
             const txSignature = getStoredTxSignature(readingPDA);
             return normalizeReading(reading, idx, txSignature);
           } catch (err) {
@@ -472,8 +490,8 @@ app.get("/tx-signature/:nodeId/:index", async (req, res) => {
     }
 
     const confirmed = await withTimeout(
-      getConfirmedSignatureForAddress(readingPDA),
-      6000,
+      withRetry(() => getConfirmedSignatureForAddress(readingPDA)),
+      8000,
       null
     );
     if (confirmed) {
@@ -492,7 +510,7 @@ app.get("/locality/:name", async (req, res) => {
     const localityPDA = await findLocalityPDA(req.params.name);
     let locality;
     try {
-      locality = await program.account.locality.fetch(localityPDA);
+      locality = await withRetry(() => program.account.locality.fetch(localityPDA));
     } catch (err) {
       if (err.message && err.message.includes("Account does not exist")) {
         return res.status(404).json({ success: false, error: "Locality not found" });
