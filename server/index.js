@@ -415,14 +415,33 @@ app.get("/readings/:nodeId", async (req, res) => {
     const nodeAccount = await program.account.node.fetch(nodePDA);
     const readingCount = nodeAccount.readingCount.toNumber();
 
-    const readings = await Promise.all(
-      Array.from({ length: readingCount }, async (_, i) => {
-        const readingPDA = await findReadingPDA(nodeId, i);
-        const reading = await program.account.reading.fetch(readingPDA);
-        const txSignature = getStoredTxSignature(readingPDA);
-        return normalizeReading(reading, i, txSignature);
-      })
-    );
+    const MAX_CONCURRENT = 10;
+    const BATCH_DELAY = 300;
+    const readings = [];
+
+    for (let i = 0; i < readingCount; i += MAX_CONCURRENT) {
+      const batch = Array.from(
+        { length: Math.min(MAX_CONCURRENT, readingCount - i) },
+        (_, j) => i + j
+      );
+      const batchResults = await Promise.all(
+        batch.map(async (idx) => {
+          try {
+            const readingPDA = await findReadingPDA(nodeId, idx);
+            const reading = await program.account.reading.fetch(readingPDA);
+            const txSignature = getStoredTxSignature(readingPDA);
+            return normalizeReading(reading, idx, txSignature);
+          } catch (err) {
+            console.warn(`Skipping reading index ${idx}: ${err.message}`);
+            return null;
+          }
+        })
+      );
+      readings.push(...batchResults.filter(Boolean));
+      if (i + MAX_CONCURRENT < readingCount) {
+        await new Promise((r) => setTimeout(r, BATCH_DELAY));
+      }
+    }
 
     res.json({ success: true, readings });
   } catch (err) {
