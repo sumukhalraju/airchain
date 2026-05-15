@@ -441,11 +441,14 @@ app.get("/readings/:nodeId", async (req, res) => {
     }
     const readingCount = nodeAccount.readingCount.toNumber();
 
+    const MAX_READINGS = 25;
+    const startIdx = Math.max(0, readingCount - MAX_READINGS);
+
     const MAX_CONCURRENT = 10;
     const BATCH_DELAY = 300;
     const readings = [];
 
-    for (let i = 0; i < readingCount; i += MAX_CONCURRENT) {
+    for (let i = startIdx; i < readingCount; i += MAX_CONCURRENT) {
       const batch = Array.from(
         { length: Math.min(MAX_CONCURRENT, readingCount - i) },
         (_, j) => i + j
